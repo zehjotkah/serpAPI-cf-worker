@@ -13,7 +13,7 @@ This Cloudflare Worker acts as a robust middleware between your website and Serp
 
 You can deploy this middleware to your own Cloudflare account in minutes without touching any code.
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zehjotkah/serpAPI-cf_worker-middleware)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zehjotkah/serpAPI-cf-worker)
 
 **Deployment Steps:**
 1.  Click the button above.
