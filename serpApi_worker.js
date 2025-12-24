@@ -10,20 +10,42 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    try {
-      const url = new URL(request.url);
-      const params = url.searchParams;
+    const url = new URL(request.url);
+    const params = url.searchParams;
+    
+    // Sort params to ensure consistent cache keys
+    params.sort();
+    const cacheKey = params.toString();
 
+    // Helper to return JSON response
+    const jsonResponse = (data, status = 200, extraHeaders = {}) => {
+      return new Response(JSON.stringify(data), {
+        status,
+        headers: { 
+          "Content-Type": "application/json", 
+          ...corsHeaders,
+          ...extraHeaders
+        }
+      });
+    };
+
+    try {
+      // ---------------------------------------------------------
+      // CORE LOGIC (Extracted from previous version)
+      // ---------------------------------------------------------
       const apiKey = params.get("api_key");
       const placeIdsParam = params.get("place_id");
       const fetchAll = ["true", "1", "yes"].includes((params.get("fetch_all") || "").toLowerCase());
-      const sortBy = params.get("sort_by") || "newestFirst"; // Default to newestFirst
+      const sortBy = params.get("sort_by") || "newestFirst";
       const hl = params.get("hl") || "de";
       const ratingFilter = params.get("rating");
+      const onlyWithReviews = ["true", "1", "yes"].includes((params.get("only_with_reviews") || "").toLowerCase());
+      const limitParam = params.get("limit");
+      const limit = limitParam ? parseInt(limitParam) : null;
       const initialNextPageToken = params.get("next_page_token");
 
-      if (!apiKey) return new Response(JSON.stringify({ error: "Missing api_key" }), { status: 400, headers: corsHeaders });
-      if (!placeIdsParam) return new Response(JSON.stringify({ error: "Missing place_id" }), { status: 400, headers: corsHeaders });
+      if (!apiKey) return jsonResponse({ error: "Missing api_key" }, 400);
+      if (!placeIdsParam) return jsonResponse({ error: "Missing place_id" }, 400);
 
       const placeIds = placeIdsParam.split(",").map(id => id.trim());
 
@@ -49,7 +71,9 @@ export default {
 
           if (data.error) {
             console.error(`Error fetching place ${placeId}:`, data.error);
-            break;
+            break; 
+            // We break here, but we don't throw yet, allowing partial results from other places 
+            // or existing pages to be processed.
           }
 
           if (data.reviews && Array.isArray(data.reviews)) {
@@ -82,13 +106,17 @@ export default {
         }
       }
 
-      // 3. Global Sort (Fix for mixed timeline)
+      // 2.2 Filter out empty reviews
+      if (onlyWithReviews) {
+        flatReviews = flatReviews.filter(review => review.snippet && review.snippet.trim().length > 0);
+      }
+
+      // 3. Global Sort
       if (sortBy === 'newestFirst') {
         flatReviews.sort((a, b) => {
-          // Use iso_date_of_last_edit if available (more accurate), otherwise iso_date
           const dateA = new Date(a.iso_date_of_last_edit || a.iso_date).getTime();
           const dateB = new Date(b.iso_date_of_last_edit || b.iso_date).getTime();
-          return dateB - dateA; // Descending (Newest first)
+          return dateB - dateA;
         });
       } else if (sortBy === 'highestRating') {
          flatReviews.sort((a, b) => b.rating - a.rating);
@@ -96,16 +124,69 @@ export default {
          flatReviews.sort((a, b) => a.rating - b.rating);
       }
 
-      return new Response(JSON.stringify({
-        total_count: flatReviews.length,
+      // 4. Limit
+      const totalCount = flatReviews.length;
+      if (limit && limit > 0) {
+        flatReviews = flatReviews.slice(0, limit);
+      }
+
+      const responseData = {
+        total_count: totalCount,
+        returned_count: flatReviews.length,
         pages_fetched: totalPages,
         reviews: flatReviews
-      }), {
-        headers: { "Content-Type": "application/json", ...corsHeaders }
-      });
+      };
+
+      // ---------------------------------------------------------
+      // CACHING STRATEGY
+      // ---------------------------------------------------------
+      
+      // If we got results, this is a "Good" response. Cache it.
+      if (responseData.total_count > 0) {
+        if (env.REVIEWS_KV) {
+          // Cache for 7 days (604800 seconds)
+          // Use ctx.waitUntil to not block the response
+          ctx.waitUntil(
+            env.REVIEWS_KV.put(cacheKey, JSON.stringify(responseData), { expirationTtl: 604800 })
+              .catch(e => console.error("KV Put Error:", e))
+          );
+        }
+        return jsonResponse(responseData);
+      } 
+      
+      // If we got 0 results, it MIGHT be a failure/empty API response.
+      // Let's check if we have a backup in cache.
+      throw new Error("No reviews found (forcing fallback check)");
 
     } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      console.error("Worker Error or Empty Result:", err);
+
+      // FALLBACK: Try to serve from KV
+      if (env.REVIEWS_KV) {
+        try {
+          const cachedData = await env.REVIEWS_KV.get(cacheKey);
+          if (cachedData) {
+            console.log("Serving from KV fallback");
+            return jsonResponse(JSON.parse(cachedData), 200, { "X-Served-From-Cache": "true" });
+          }
+        } catch (kvErr) {
+          console.error("KV Get Error:", kvErr);
+        }
+      }
+
+      // If no cache or KV error, return the original error/empty state
+      // (If it was the "No reviews found" error, we might want to just return an empty list if we really have nothing)
+      if (err.message === "No reviews found (forcing fallback check)") {
+         return jsonResponse({
+            total_count: 0,
+            returned_count: 0,
+            pages_fetched: 0,
+            reviews: [],
+            warning: "No reviews found and no cache available."
+         });
+      }
+
+      return jsonResponse({ error: err.message }, 500);
     }
   }
 };

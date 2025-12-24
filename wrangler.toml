@@ -1,0 +1,10 @@
+name = "serpapi-middleware"
+main = "serpApi_worker.js"
+compatibility_date = "2024-01-01"
+
+# KV Namespace Binding
+# During the 'Deploy to Cloudflare Workers' flow, Cloudflare will ask you to bind a KV namespace to 'REVIEWS_KV'.
+[[kv_namespaces]]
+binding = "REVIEWS_KV"
+id = "" # Leave empty for auto-deployment flow, or fill manually if using CLI
+preview_id = ""
