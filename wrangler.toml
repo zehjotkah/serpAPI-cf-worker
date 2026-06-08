@@ -6,5 +6,4 @@ compatibility_date = "2024-01-01"
 # During the 'Deploy to Cloudflare Workers' flow, Cloudflare will ask you to bind a KV namespace to 'REVIEWS_KV'.
 [[kv_namespaces]]
 binding = "REVIEWS_KV"
-id = "" # Leave empty for auto-deployment flow, or fill manually if using CLI
-preview_id = ""
+id = "04d6aa2c433040eb97b928bda50fdf8c"
