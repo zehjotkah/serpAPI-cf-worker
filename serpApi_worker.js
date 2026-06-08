@@ -12,6 +12,18 @@ export default {
 
     const url = new URL(request.url);
     const params = url.searchParams;
+
+    // Parse and validate cache_ttl before building cache key
+    const cacheTtlParam = params.get("cache_ttl");
+    let cacheTtl = cacheTtlParam ? parseInt(cacheTtlParam) : 0;
+    if (cacheTtlParam && (isNaN(cacheTtl) || cacheTtl < 60 || cacheTtl > 604800)) {
+      return new Response(JSON.stringify({ error: "cache_ttl must be an integer between 60 and 604800 seconds" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+    }
+    // Strip cache_ttl from params so it doesn't fragment cache keys
+    params.delete("cache_ttl");
     
     // Sort params to ensure consistent cache keys
     params.sort();
@@ -30,6 +42,29 @@ export default {
     };
 
     try {
+      // ---------------------------------------------------------
+      // CACHE-FIRST CHECK (opt-in via cache_ttl param)
+      // ---------------------------------------------------------
+      if (cacheTtl > 0 && env.REVIEWS_KV) {
+        try {
+          const { value: cachedValue, metadata } = await env.REVIEWS_KV.getWithMetadata(cacheKey);
+          if (cachedValue && metadata && metadata.cachedAt) {
+            const ageMs = Date.now() - metadata.cachedAt;
+            if (ageMs < cacheTtl * 1000) {
+              const ageSeconds = Math.round(ageMs / 1000);
+              return jsonResponse(JSON.parse(cachedValue), 200, {
+                "X-Served-From-Cache": "true",
+                "X-Cache-Age": String(ageSeconds)
+              });
+            }
+          }
+          // No cache, no metadata (legacy entry), or stale → proceed to SerpAPI
+        } catch (kvErr) {
+          console.error("KV cache-first read error:", kvErr);
+          // Swallow error, proceed to SerpAPI
+        }
+      }
+
       // ---------------------------------------------------------
       // CORE LOGIC (Extracted from previous version)
       // ---------------------------------------------------------
@@ -144,10 +179,13 @@ export default {
       // If we got results, this is a "Good" response. Cache it.
       if (responseData.total_count > 0) {
         if (env.REVIEWS_KV) {
-          // Cache for 7 days (604800 seconds)
+          // Cache for 7 days (604800 seconds) with timestamp metadata for cache-first TTL checks
           // Use ctx.waitUntil to not block the response
           ctx.waitUntil(
-            env.REVIEWS_KV.put(cacheKey, JSON.stringify(responseData), { expirationTtl: 604800 })
+            env.REVIEWS_KV.put(cacheKey, JSON.stringify(responseData), {
+              expirationTtl: 604800,
+              metadata: { cachedAt: Date.now() }
+            })
               .catch(e => console.error("KV Put Error:", e))
           );
         }
