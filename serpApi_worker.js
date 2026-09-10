@@ -1,3 +1,7 @@
+// Cache keys with a background revalidation in flight in this isolate.
+// Best-effort dedupe so concurrent stale hits don't each trigger a SerpApi refresh.
+const revalidatingKeys = new Set();
+
 export default {
   async fetch(request, env, ctx) {
     const corsHeaders = {
@@ -10,78 +14,58 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    const url = new URL(request.url);
-    const params = url.searchParams;
-
-    // Parse and validate cache_ttl before building cache key
-    const cacheTtlParam = params.get("cache_ttl");
-    let cacheTtl = cacheTtlParam ? parseInt(cacheTtlParam) : 0;
-    if (cacheTtlParam && (isNaN(cacheTtl) || cacheTtl < 60 || cacheTtl > 604800)) {
-      return new Response(JSON.stringify({ error: "cache_ttl must be an integer between 60 and 604800 seconds" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json", ...corsHeaders }
-      });
-    }
-    // Strip cache_ttl from params so it doesn't fragment cache keys
-    params.delete("cache_ttl");
-    
-    // Sort params to ensure consistent cache keys
-    params.sort();
-    const cacheKey = params.toString();
-
     // Helper to return JSON response
     const jsonResponse = (data, status = 200, extraHeaders = {}) => {
       return new Response(JSON.stringify(data), {
         status,
-        headers: { 
-          "Content-Type": "application/json", 
+        headers: {
+          "Content-Type": "application/json",
           ...corsHeaders,
           ...extraHeaders
         }
       });
     };
 
-    try {
-      // ---------------------------------------------------------
-      // CACHE-FIRST CHECK (opt-in via cache_ttl param)
-      // ---------------------------------------------------------
-      if (cacheTtl > 0 && env.REVIEWS_KV) {
-        try {
-          const { value: cachedValue, metadata } = await env.REVIEWS_KV.getWithMetadata(cacheKey);
-          if (cachedValue && metadata && metadata.cachedAt) {
-            const ageMs = Date.now() - metadata.cachedAt;
-            if (ageMs < cacheTtl * 1000) {
-              const ageSeconds = Math.round(ageMs / 1000);
-              return jsonResponse(JSON.parse(cachedValue), 200, {
-                "X-Served-From-Cache": "true",
-                "X-Cache-Age": String(ageSeconds)
-              });
-            }
-          }
-          // No cache, no metadata (legacy entry), or stale → proceed to SerpAPI
-        } catch (kvErr) {
-          console.error("KV cache-first read error:", kvErr);
-          // Swallow error, proceed to SerpAPI
-        }
-      }
+    const url = new URL(request.url);
+    const params = url.searchParams;
 
-      // ---------------------------------------------------------
-      // CORE LOGIC (Extracted from previous version)
-      // ---------------------------------------------------------
-      const apiKey = params.get("api_key");
-      const placeIdsParam = params.get("place_id");
-      const fetchAll = ["true", "1", "yes"].includes((params.get("fetch_all") || "").toLowerCase());
-      const sortBy = params.get("sort_by") || "newestFirst";
-      const hl = params.get("hl") || "de";
-      const ratingFilter = params.get("rating");
-      const onlyWithReviews = ["true", "1", "yes"].includes((params.get("only_with_reviews") || "").toLowerCase());
-      const limitParam = params.get("limit");
-      const limit = limitParam ? parseInt(limitParam) : null;
-      const initialNextPageToken = params.get("next_page_token");
+    // Parse and validate cache_ttl / stale_while_revalidate before building cache key
+    const cacheTtlParam = params.get("cache_ttl");
+    let cacheTtl = cacheTtlParam ? parseInt(cacheTtlParam) : 0;
+    if (cacheTtlParam && (isNaN(cacheTtl) || cacheTtl < 60 || cacheTtl > 604800)) {
+      return jsonResponse({ error: "cache_ttl must be an integer between 60 and 604800 seconds" }, 400);
+    }
+    const swrParam = params.get("stale_while_revalidate");
+    const staleWhileRevalidate = swrParam ? parseInt(swrParam) : 0;
+    if (swrParam && (isNaN(staleWhileRevalidate) || staleWhileRevalidate < 60 || staleWhileRevalidate > 604800)) {
+      return jsonResponse({ error: "stale_while_revalidate must be an integer between 60 and 604800 seconds" }, 400);
+    }
+    if (swrParam && !cacheTtlParam) {
+      return jsonResponse({ error: "stale_while_revalidate requires cache_ttl" }, 400);
+    }
+    // Strip cache control params so they don't fragment cache keys
+    params.delete("cache_ttl");
+    params.delete("stale_while_revalidate");
 
-      if (!apiKey) return jsonResponse({ error: "Missing api_key" }, 400);
-      if (!placeIdsParam) return jsonResponse({ error: "Missing place_id" }, 400);
+    // Sort params to ensure consistent cache keys
+    params.sort();
+    const cacheKey = params.toString();
 
+    const apiKey = params.get("api_key");
+    const placeIdsParam = params.get("place_id");
+    const fetchAll = ["true", "1", "yes"].includes((params.get("fetch_all") || "").toLowerCase());
+    const sortBy = params.get("sort_by") || "newestFirst";
+    const hl = params.get("hl") || "de";
+    const ratingFilter = params.get("rating");
+    const onlyWithReviews = ["true", "1", "yes"].includes((params.get("only_with_reviews") || "").toLowerCase());
+    const limitParam = params.get("limit");
+    const limit = limitParam ? parseInt(limitParam) : null;
+    const initialNextPageToken = params.get("next_page_token");
+
+    // ---------------------------------------------------------
+    // CORE LOGIC: fetch from SerpApi, then filter, sort and limit
+    // ---------------------------------------------------------
+    const fetchFreshData = async () => {
       const placeIds = placeIdsParam.split(",").map(id => id.trim());
 
       const fetchReviewsForPlace = async (placeId) => {
@@ -106,8 +90,8 @@ export default {
 
           if (data.error) {
             console.error(`Error fetching place ${placeId}:`, data.error);
-            break; 
-            // We break here, but we don't throw yet, allowing partial results from other places 
+            break;
+            // We break here, but we don't throw yet, allowing partial results from other places
             // or existing pages to be processed.
           }
 
@@ -165,33 +149,90 @@ export default {
         flatReviews = flatReviews.slice(0, limit);
       }
 
-      const responseData = {
+      return {
         total_count: totalCount,
         returned_count: flatReviews.length,
         pages_fetched: totalPages,
         reviews: flatReviews
       };
+    };
+
+    // Cache for 7 days (604800 seconds) with timestamp metadata for cache-first TTL checks
+    const putCache = (data) =>
+      env.REVIEWS_KV.put(cacheKey, JSON.stringify(data), {
+        expirationTtl: 604800,
+        metadata: { cachedAt: Date.now() }
+      })
+        .catch(e => console.error("KV Put Error:", e));
+
+    // Refresh the cache after the response is sent. Only good (non-empty) results
+    // overwrite the entry, so a failed refresh leaves the stale data in place.
+    const revalidateInBackground = () => {
+      if (revalidatingKeys.has(cacheKey)) return;
+      revalidatingKeys.add(cacheKey);
+      ctx.waitUntil(
+        fetchFreshData()
+          .then(data => {
+            if (data.total_count > 0) return putCache(data);
+            console.warn("SWR revalidation returned no reviews, keeping stale cache");
+          })
+          .catch(e => console.error("SWR revalidation error:", e))
+          .finally(() => revalidatingKeys.delete(cacheKey))
+      );
+    };
+
+    try {
+      // ---------------------------------------------------------
+      // CACHE-FIRST CHECK (opt-in via cache_ttl param)
+      // ---------------------------------------------------------
+      if (cacheTtl > 0 && env.REVIEWS_KV) {
+        try {
+          const { value: cachedValue, metadata } = await env.REVIEWS_KV.getWithMetadata(cacheKey);
+          if (cachedValue && metadata && metadata.cachedAt) {
+            const ageMs = Date.now() - metadata.cachedAt;
+            const ageSeconds = Math.round(ageMs / 1000);
+            if (ageMs < cacheTtl * 1000) {
+              return jsonResponse(JSON.parse(cachedValue), 200, {
+                "X-Served-From-Cache": "true",
+                "X-Cache-Age": String(ageSeconds)
+              });
+            }
+            // Stale but within the stale_while_revalidate window → serve stale, refresh in background
+            if (ageMs < (cacheTtl + staleWhileRevalidate) * 1000 && apiKey && placeIdsParam) {
+              const staleData = JSON.parse(cachedValue);
+              revalidateInBackground();
+              return jsonResponse(staleData, 200, {
+                "X-Served-From-Cache": "true",
+                "X-Cache-Age": String(ageSeconds),
+                "X-Cache-Stale": "true"
+              });
+            }
+          }
+          // No cache, no metadata (legacy entry), or stale beyond window → proceed to SerpAPI
+        } catch (kvErr) {
+          console.error("KV cache-first read error:", kvErr);
+          // Swallow error, proceed to SerpAPI
+        }
+      }
+
+      if (!apiKey) return jsonResponse({ error: "Missing api_key" }, 400);
+      if (!placeIdsParam) return jsonResponse({ error: "Missing place_id" }, 400);
+
+      const responseData = await fetchFreshData();
 
       // ---------------------------------------------------------
       // CACHING STRATEGY
       // ---------------------------------------------------------
-      
+
       // If we got results, this is a "Good" response. Cache it.
       if (responseData.total_count > 0) {
         if (env.REVIEWS_KV) {
-          // Cache for 7 days (604800 seconds) with timestamp metadata for cache-first TTL checks
           // Use ctx.waitUntil to not block the response
-          ctx.waitUntil(
-            env.REVIEWS_KV.put(cacheKey, JSON.stringify(responseData), {
-              expirationTtl: 604800,
-              metadata: { cachedAt: Date.now() }
-            })
-              .catch(e => console.error("KV Put Error:", e))
-          );
+          ctx.waitUntil(putCache(responseData));
         }
         return jsonResponse(responseData);
-      } 
-      
+      }
+
       // If we got 0 results, it MIGHT be a failure/empty API response.
       // Let's check if we have a backup in cache.
       throw new Error("No reviews found (forcing fallback check)");
